@@ -1,0 +1,793 @@
+import { db } from './db.js';
+import { extractPdfPages, renderPdfPage, normalizeArabic } from './pdf-engine.js';
+import { askAI, parseAIJson } from './ai-engine.js';
+
+const PAGE_TITLES = {
+  home: 'الرئيسية', library: 'مكتبة الكتب', reader: 'قارئ PDF',
+  chat: 'المساعد الذكي', summary: 'التلخيص', quiz: 'الاختبارات',
+  flashcards: 'الحفظ والبطاقات', explain: 'شرح الدروس والأبحاث',
+  solver: 'حل المسائل والعلوم', planner: 'جدول الدراسة',
+  progress: 'سجل الدرجات والتقدم', settings: 'الإعدادات والنسخ الاحتياطي'
+};
+
+const state = {
+  currentPage: 'home',
+  readerBookId: null,
+  readerPage: 1,
+  readerScale: 1.2,
+  chatImage: { base64: '', mimeType: '' },
+  solverImage: { base64: '', mimeType: '' },
+  timerSec: 25 * 60,
+  timerInterval: null,
+  fcIndex: 0,
+  fcFlipped: false
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s = '') => String(s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.add('hidden'), 2800);
+}
+
+function updateNetworkBadge() {
+  const b = $('net-badge');
+  if (navigator.onLine) {
+    b.textContent = 'متصل';
+    b.className = 'badge badge-online';
+  } else {
+    b.textContent = 'غير متصل';
+    b.className = 'badge badge-offline';
+  }
+}
+
+async function applyTheme(dark) {
+  document.body.classList.toggle('dark', Boolean(dark));
+  $('set-dark-mode').checked = Boolean(dark);
+  $('btn-theme-top').textContent = dark ? '☀️' : '🌙';
+  await db.setSetting('darkMode', Boolean(dark));
+}
+
+function navigate(page) {
+  state.currentPage = page;
+  document.querySelectorAll('.page').forEach((p) => p.classList.add('hidden'));
+  $(`page-${page}`)?.classList.remove('hidden');
+  $('page-title').textContent = PAGE_TITLES[page] || 'Bashar Study AI';
+
+  document.querySelectorAll('[data-nav]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.nav === page);
+  });
+  $('drawer').classList.add('hidden');
+  refreshCurrentView(page);
+}
+
+async function populateBookSelects() {
+  const books = await db.getAll('books');
+  const ids = [
+    'reader-book-select', 'chat-book-select', 'sum-book-select',
+    'quiz-book-select', 'fc-book-select', 'exp-book-select', 'solver-book-select'
+  ];
+  for (const id of ids) {
+    const sel = $(id);
+    if (!sel) continue;
+    const prev = sel.value;
+    const firstOpt = id === 'chat-book-select'
+      ? '<option value="">كل الكتب المحفوظة</option>'
+      : '<option value="">-- اختر كتاباً --</option>';
+    sel.innerHTML = firstOpt + books.map((b) => `<option value="${b.id}">${esc(b.title)} (${b.numPages} ص)</option>`).join('');
+    if (prev) sel.value = prev;
+  }
+}
+
+async function refreshHome() {
+  const [books, cards, scores, tasks] = await Promise.all([
+    db.getAll('books'), db.getAll('flashcards'), db.getAll('scores'), db.getAll('tasks')
+  ]);
+  const dueCards = cards.filter((c) => (c.nextReview || 0) <= Date.now());
+  const avg = scores.length ? Math.round(scores.reduce((a, s) => a + s.percent, 0) / scores.length) : 0;
+  const openTasks = tasks.filter((t) => !t.done);
+
+  $('stat-books').textContent = books.length;
+  $('stat-cards').textContent = dueCards.length;
+  $('stat-avg').textContent = `${avg}%`;
+  $('stat-tasks').textContent = openTasks.length;
+
+  const lowScores = scores.filter((s) => s.percent < 70);
+  const box = $('home-suggestions');
+  if (!lowScores.length && !dueCards.length) {
+    box.innerHTML = '<div class="meta">ممتاز! مستواك مستقر ولا توجد مراجعات متأخرة حالياً.</div>';
+  } else {
+    box.innerHTML = [
+      ...lowScores.slice(0, 3).map((s) => `<div class="item-row"><strong>📌 إعادة مراجعة: ${esc(s.title)}</strong><span class="meta">درجتك السابقة ${s.percent}%</span></div>`),
+      ...(dueCards.length ? [`<div class="item-row"><strong>🗂️ لديك ${dueCards.length} بطاقة حفظ حان وقت مراجعتها</strong></div>`] : [])
+    ].join('');
+  }
+}
+
+/* ---------- مكتبة الكتب ---------- */
+async function handleBookImport(file) {
+  if (!file) return;
+  const prog = $('import-progress');
+  prog.classList.remove('hidden');
+  prog.textContent = 'جارٍ استيراد الملف واستخراج النصوص للعمل أوفلاين...';
+
+  try {
+    const id = `book_${Date.now()}`;
+    const title = $('book-title').value.trim() || file.name.replace(/\.[^.]+$/, '');
+    const subject = $('book-subject').value.trim() || 'عام';
+    const grade = $('book-grade').value.trim() || 'غير محدد';
+    const term = $('book-term').value.trim() || 'غير محدد';
+    const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+
+    let buffer = null;
+    let pages = [];
+    let numPages = 1;
+
+    if (isPdf) {
+      buffer = await file.arrayBuffer();
+      const res = await extractPdfPages(buffer, (curr, total) => {
+        prog.textContent = `استخراج النصوص العربية: صفحة ${curr} من ${total}`;
+      });
+      numPages = res.numPages;
+      pages = res.pages;
+    } else {
+      const txt = await file.text();
+      pages = [{ page: 1, text: txt, norm: normalizeArabic(txt) }];
+    }
+
+    await db.put('books', {
+      id, title, subject, grade, term, isPdf, numPages,
+      lastPage: 1, buffer, createdAt: Date.now()
+    });
+    for (const p of pages) {
+      await db.put('pages', { id: `${id}_p${p.page}`, bookId: id, ...p });
+    }
+
+    $('book-title').value = '';
+    toast('تم حفظ الكتاب محلياً بنجاح');
+    await populateBookSelects();
+    await renderLibrary();
+  } catch (e) {
+    toast(`خطأ في استيراد الملف: ${e.message}`);
+  } finally {
+    prog.classList.add('hidden');
+    $('book-file-input').value = '';
+  }
+}
+
+async function renderLibrary() {
+  const books = await db.getAll('books');
+  const q = normalizeArabic($('lib-search').value);
+  const subj = $('lib-subject-filter').value;
+
+  const subjects = [...new Set(books.map((b) => b.subject).filter(Boolean))];
+  const sel = $('lib-subject-filter');
+  sel.innerHTML = '<option value="">كل المواد</option>' + subjects.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  sel.value = subj;
+
+  const filtered = [];
+  for (const b of books) {
+    if (subj && b.subject !== subj) continue;
+    let matchHit = !q || normalizeArabic(b.title + ' ' + b.subject).includes(q);
+    if (!matchHit && q) {
+      const pages = await db.getBookPages(b.id);
+      matchHit = pages.some((p) => p.norm.includes(q));
+    }
+    if (matchHit) filtered.push(b);
+  }
+
+  $('books-list').innerHTML = filtered.length
+    ? filtered.map((b) => `
+      <div class="item-row">
+        <div class="item-top">
+          <strong>${esc(b.title)}</strong>
+          <span class="badge">متاح أوفلاين • ${b.numPages} ص</span>
+        </div>
+        <div class="meta">${esc(b.subject)} | ${esc(b.grade)} | الفصل: ${esc(b.term)} | آخر صفحة: ${b.lastPage || 1}</div>
+        <div class="inline-row">
+          <button class="btn btn-primary btn-sm" data-open-book="${b.id}">فتح القارئ</button>
+          <button class="btn btn-danger btn-sm" data-del-book="${b.id}">حذف</button>
+        </div>
+      </div>`).join('')
+    : '<div class="meta">لا توجد كتب بعد. استورد كتاب PDF من الأعلى.</div>';
+}
+
+/* ---------- قارئ PDF ---------- */
+async function openBookInReader(bookId, pageNum = null) {
+  const book = await db.get('books', bookId);
+  if (!book) return;
+  state.readerBookId = bookId;
+  state.readerPage = pageNum || book.lastPage || 1;
+  $('reader-book-select').value = bookId;
+  await renderCurrentReaderPage();
+}
+
+async function renderCurrentReaderPage() {
+  const book = await db.get('books', state.readerBookId);
+  if (!book) return;
+  const canvas = $('pdf-canvas');
+  const txtView = $('txt-reader-view');
+
+  if (book.isPdf && book.buffer) {
+    canvas.classList.remove('hidden');
+    txtView.classList.add('hidden');
+    const info = await renderPdfPage(book.buffer, state.readerPage, canvas, state.readerScale);
+    state.readerPage = info.currentPage;
+    $('reader-page-info').textContent = `${info.currentPage} / ${info.totalPages}`;
+  } else {
+    canvas.classList.add('hidden');
+    txtView.classList.remove('hidden');
+    const pages = await db.getBookPages(book.id);
+    txtView.textContent = pages[0]?.text || 'لا يوجد نص.';
+    $('reader-page-info').textContent = '1 / 1';
+  }
+  book.lastPage = state.readerPage;
+  await db.put('books', book);
+}
+
+async function searchInsideReaderBook() {
+  if (!state.readerBookId) return toast('اختر كتاباً أولاً');
+  const q = normalizeArabic($('reader-search-input').value);
+  if (!q) return;
+  const pages = await db.getBookPages(state.readerBookId);
+  const hits = pages.filter((p) => p.norm.includes(q));
+  $('reader-search-results').innerHTML = hits.length
+    ? hits.map((h) => `<div class="search-hit" data-jump-page="${h.page}"><strong>صفحة ${h.page}:</strong> ${esc(h.text.slice(0, 140))}...</div>`).join('')
+    : '<div class="meta">لم يتم العثور على نتائج مطابقة.</div>';
+}
+
+/* ---------- المساعد الذكي ---------- */
+async function renderChatHistory() {
+  const chats = await db.getAll('chats');
+  chats.sort((a, b) => a.ts - b.ts);
+  $('chat-messages').innerHTML = chats.length
+    ? chats.map((m) => `<div class="msg ${m.role === 'user' ? 'msg-user' : 'msg-ai'}">${esc(m.text)}</div>`).join('')
+    : '<div class="meta">ابدأ المحادثة بسؤال من كتابك أو أرفق صورة تمرين.</div>';
+  $('chat-messages').scrollTop = $('chat-messages').scrollHeight;
+}
+
+async function sendChatMessage() {
+  const text = $('chat-input').value.trim();
+  if (!text && !state.chatImage.base64) return;
+  const provider = $('chat-provider').value;
+  const bookId = $('chat-book-select').value;
+
+  await db.put('chats', { id: `m_${Date.now()}`, role: 'user', text: text || '📷 [صورة سؤال]', ts: Date.now() });
+  $('chat-input').value = '';
+  await renderChatHistory();
+
+  try {
+    const res = await askAI({
+      prompt: text || 'اشرح وحل السؤال الموجود في الصورة خطوة بخطوة.',
+      bookId,
+      provider,
+      imageBase64: state.chatImage.base64,
+      mimeType: state.chatImage.mimeType
+    });
+    await db.put('chats', { id: `m_${Date.now() + 1}`, role: 'ai', text: res.text, ts: Date.now() + 1 });
+  } catch (e) {
+    await db.put('chats', { id: `m_${Date.now() + 1}`, role: 'ai', text: `❌ خطأ: ${e.message}`, ts: Date.now() + 1 });
+  }
+  state.chatImage = { base64: '', mimeType: '' };
+  $('chat-image-preview').classList.add('hidden');
+  $('chat-image-preview').innerHTML = '';
+  await renderChatHistory();
+}
+
+/* ---------- التلخيص ---------- */
+async function generateSummary() {
+  const bookId = $('sum-book-select').value;
+  if (!bookId) return toast('اختر كتاباً للتلخيص');
+  const book = await db.get('books', bookId);
+  const from = Number($('sum-from').value) || 1;
+  const to = Number($('sum-to').value) || from + 4;
+  const length = $('sum-length').value;
+  const pages = (await db.getBookPages(bookId)).filter((p) => p.page >= from && p.page <= to);
+  if (!pages.length) return toast('لا توجد نصوص في نطاق الصفحات المحدد');
+
+  const combined = pages.map((p) => `[ص${p.page}] ${p.text}`).join('\n').slice(0, 9000);
+  const provider = await db.getSetting('defaultProvider', 'gemini');
+  let content = '';
+
+  if (navigator.onLine && (await db.getSetting('proxyUrl', ''))) {
+    const style = length === 'short' ? 'ملخص قصير جداً بنقاط مركزة' : length === 'medium' ? 'ملخص متوسط منظم بالأفكار الرئيسية' : 'ملخص مفصل يشمل الأفكار الرئيسية والتعريفات والقوانين المهمة';
+    const res = await askAI({
+      prompt: `أنشئ ${style} للنص التالي مع الإشارة إلى أرقام الصفحات:\n\n${combined}`,
+      bookId,
+      provider
+    });
+    content = res.text;
+  } else {
+    content = `📝 تلخيص محلي (وضع أوفلاين) لكتاب "${book.title}" (ص ${from}–${to}):\n\n` +
+      pages.map((p) => `• صفحة ${p.page}: ${p.text.split(/[.!؟\n]/).slice(0, 3).join(' - ')}`).join('\n');
+  }
+
+  await db.put('summaries', {
+    id: `sum_${Date.now()}`,
+    title: `${book.title} (ص ${from}-${to})`,
+    content,
+    createdAt: Date.now()
+  });
+  toast('تم حفظ الملخص');
+  renderSummaries();
+}
+
+async function renderSummaries() {
+  const list = await db.getAll('summaries');
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  $('summaries-list').innerHTML = list.length
+    ? list.map((s) => `
+      <div class="item-row">
+        <div class="item-top">
+          <strong>${esc(s.title)}</strong>
+          <button class="btn btn-danger btn-sm" data-del-sum="${s.id}">حذف</button>
+        </div>
+        <textarea rows="5" data-edit-sum="${s.id}">${esc(s.content)}</textarea>
+        <button class="btn btn-sm" data-save-sum="${s.id}">حفظ تصحيح الطالب</button>
+      </div>`).join('')
+    : '<div class="meta">لا توجد ملخصات محفوظة بعد.</div>';
+}
+
+/* ---------- الاختبارات ---------- */
+async function generateQuiz() {
+  const bookId = $('quiz-book-select').value;
+  if (!bookId) return toast('اختر كتاباً أولاً');
+  const book = await db.get('books', bookId);
+  const type = $('quiz-type').value;
+  const difficulty = $('quiz-difficulty').value;
+  const count = Math.min(15, Math.max(3, Number($('quiz-count').value) || 5));
+  const pages = await db.getBookPages(bookId);
+  const sampleText = pages.slice(0, 8).map((p) => `[ص${p.page}] ${p.text}`).join('\n').slice(0, 7500);
+  const provider = await db.getSetting('defaultProvider', 'gemini');
+
+  let questions = [];
+  if (navigator.onLine && (await db.getSetting('proxyUrl', ''))) {
+    try {
+      const prompt = `أنشئ اختباراً بصيغة JSON فقط (مصفوفة objects) من النص التالي.
+النوع: ${type}, الصعوبة: ${difficulty}, العدد: ${count}.
+كل عنصر يحتوي: {"q":"السؤال","type":"mcq|tf|fill|essay","options":["..."],"answer":"الإجابة الصحيحة","explanation":"التفسير ورقم الصفحة"}.
+النص:\n${sampleText}`;
+      const res = await askAI({ prompt, bookId, provider });
+      questions = parseAIJson(res.text);
+    } catch {
+      questions = [];
+    }
+  }
+
+  if (!Array.isArray(questions) || !questions.length) {
+    questions = pages.slice(0, count).map((p, idx) => {
+      const sentence = p.text.split(/[.!؟\n]/).find((s) => s.trim().length > 20) || p.text.slice(0, 90);
+      return {
+        q: `راجع العبارة من صفحة ${p.page}: هل وردت هذه الفكرة في الكتاب؟\n"${sentence.trim()}"`,
+        type: 'tf',
+        options: ['صح', 'خطأ'],
+        answer: 'صح',
+        explanation: `وردت في كتاب ${book.title} - صفحة ${p.page} (توليد محلي أوفلاين).`
+      };
+    });
+  }
+
+  const quiz = { id: `quiz_${Date.now()}`, title: `اختبار: ${book.title}`, subject: book.subject, questions, createdAt: Date.now() };
+  await db.put('quizzes', quiz);
+  renderSavedQuizzes();
+  startQuiz(quiz);
+}
+
+function startQuiz(quiz) {
+  const runner = $('quiz-runner');
+  runner.classList.remove('hidden');
+  runner.innerHTML = `
+    <h4>${esc(quiz.title)}</h4>
+    ${quiz.questions.map((item, i) => `
+      <div class="item-row" style="margin-bottom:10px;">
+        <strong>س${i + 1}: ${esc(item.q)}</strong>
+        ${item.options?.length
+          ? item.options.map((opt) => `<label class="inline-row"><input type="radio" name="q_${i}" value="${esc(opt)}" style="width:auto;" /> <span>${esc(opt)}</span></label>`).join('')
+          : `<input type="text" id="q_text_${i}" placeholder="اكتب إجابتك..." />`}
+        <div id="q_fb_${i}" class="meta hidden"></div>
+      </div>`).join('')}
+    <button id="btn-grade-quiz" class="btn btn-primary full">تصحيح الاختبار ومراجعة الإجابات</button>
+    <div id="quiz-final-box" class="hidden" style="margin-top:12px;"></div>
+  `;
+
+  $('btn-grade-quiz').onclick = () => {
+    let correct = 0;
+    quiz.questions.forEach((item, i) => {
+      const userAns = item.options?.length
+        ? (document.querySelector(`input[name="q_${i}"]:checked`)?.value || '')
+        : ($(`q_text_${i}`)?.value || '');
+      const isOk = normalizeArabic(userAns) === normalizeArabic(item.answer);
+      if (isOk) correct++;
+      const fb = $(`q_fb_${i}`);
+      fb.classList.remove('hidden');
+      fb.innerHTML = `${isOk ? '✅ إجابة صحيحة' : '❌ غير مطابق'} — <b>الإجابة المعتمدة:</b> ${esc(item.answer)}<br/><i>${esc(item.explanation || '')}</i>`;
+    });
+    const percent = Math.round((correct / quiz.questions.length) * 100);
+    const finalBox = $('quiz-final-box');
+    finalBox.classList.remove('hidden');
+    finalBox.innerHTML = `
+      <div class="item-row">
+        <strong>الدرجة المحسوبة: ${correct} / ${quiz.questions.length} (${percent}%)</strong>
+        <small class="hint">تحقق من الأسئلة المقالية قبل اعتماد الدرجة النهائية.</small>
+        <div class="inline-row">
+          <input id="manual-percent" type="number" min="0" max="100" value="${percent}" />
+          <button id="btn-save-score" class="btn btn-primary">اعتماد وحفظ الدرجة</button>
+        </div>
+      </div>`;
+    $('btn-save-score').onclick = async () => {
+      const finalPercent = Math.min(100, Math.max(0, Number($('manual-percent').value) || 0));
+      await db.put('scores', { id: `sc_${Date.now()}`, title: quiz.title, subject: quiz.subject || 'عام', percent: finalPercent, ts: Date.now() });
+      toast('تم حفظ الدرجة في سجل التقدم');
+    };
+  };
+}
+
+async function renderSavedQuizzes() {
+  const list = await db.getAll('quizzes');
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  $('saved-quizzes-list').innerHTML = list.length
+    ? list.map((q) => `
+      <div class="item-row">
+        <div class="item-top"><strong>${esc(q.title)}</strong><span class="badge">${q.questions.length} أسئلة</span></div>
+        <div class="inline-row">
+          <button class="btn btn-primary btn-sm" data-run-quiz="${q.id}">بدء الاختبار</button>
+          <button class="btn btn-danger btn-sm" data-del-quiz="${q.id}">حذف</button>
+        </div>
+      </div>`).join('')
+    : '<div class="meta">لا توجد اختبارات محفوظة.</div>';
+}
+
+/* ---------- البطاقات التعليمية SM-2 ---------- */
+async function renderFlashcards() {
+  const cards = await db.getAll('flashcards');
+  const due = cards.filter((c) => (c.nextReview || 0) <= Date.now());
+  $('fc-stats-badge').textContent = `${due.length} للمراجعة / ${cards.length} الإجمالي`;
+  const stage = $('fc-review-stage');
+
+  if (!due.length) {
+    stage.innerHTML = '<div class="meta">لا توجد بطاقات مستحقة للمراجعة حالياً. أضف بطاقات جديدة أو ولّدها من كتابك.</div>';
+    return;
+  }
+  const card = due[state.fcIndex % due.length];
+  stage.innerHTML = `
+    <div id="fc-card-box" class="flashcard-3d">${esc(state.fcFlipped ? card.back : card.front)}</div>
+    <div class="inline-row center">
+      <button class="btn btn-sm" data-rate-fc="1" data-fc-id="${card.id}">صعب (أعد قريباً)</button>
+      <button class="btn btn-sm btn-primary" data-rate-fc="3" data-fc-id="${card.id}">جيد</button>
+      <button class="btn btn-sm" data-rate-fc="5" data-fc-id="${card.id}">متقن (سهل)</button>
+    </div>`;
+  $('fc-card-box').onclick = () => { state.fcFlipped = !state.fcFlipped; renderFlashcards(); };
+}
+
+async function rateFlashcard(id, quality) {
+  const card = await db.get('flashcards', id);
+  if (!card) return;
+  let reps = card.reps || 0;
+  let interval = card.interval || 1;
+  let ef = card.ef || 2.5;
+  if (quality < 3) {
+    reps = 0; interval = 1;
+  } else {
+    interval = reps === 0 ? 1 : reps === 1 ? 6 : Math.round(interval * ef);
+    reps++;
+  }
+  ef = Math.max(1.3, ef + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02)));
+  card.reps = reps; card.interval = interval; card.ef = ef;
+  card.nextReview = Date.now() + (quality < 3 ? 60 * 1000 : interval * 86400000);
+  await db.put('flashcards', card);
+  state.fcFlipped = false;
+  renderFlashcards();
+}
+
+/* ---------- الشرح والأبحاث + حل المسائل ---------- */
+async function runExplainOrResearch() {
+  const topic = $('exp-topic').value.trim();
+  if (!topic) return toast('اكتب موضوع الدرس أو البحث');
+  const bookId = $('exp-book-select').value;
+  const mode = $('exp-mode').value;
+  const provider = await db.getSetting('defaultProvider', 'gemini');
+  const promptMap = {
+    lesson: `اشرح الدرس التالي خطوة بخطوة مع أمثلة تطبيقية مبسطة:\n${topic}`,
+    terms: `اشرح المصطلحات الصعبة التالية بلغة سهلة للطلاب:\n${topic}`,
+    research: `نظّم مخطط بحث علمي للموضوع التالي مع أفكار ومراجع موثقة من الكتاب فقط دون اختلاق مراجع:\n${topic}`
+  };
+  const out = $('explain-output');
+  out.classList.remove('hidden');
+  out.textContent = 'جارٍ التحضير...';
+  const res = await askAI({ prompt: promptMap[mode], bookId, provider });
+  out.textContent = res.text;
+}
+
+async function solveProblem() {
+  const problem = $('solver-input').value.trim();
+  if (!problem && !state.solverImage.base64) return toast('اكتب المسألة أو أرفق صورتها');
+  const bookId = $('solver-book-select').value;
+  const provider = await db.getSetting('defaultProvider', 'gemini');
+  const out = $('solver-output');
+  out.classList.remove('hidden');
+  out.textContent = 'جارٍ الحل بالتدرج...';
+  const prompt = `حل المسألة التالية بالتدرج واذكر: 1) القانون المستخدم 2) خطوات الحل 3) التحقق من الناتج 4) الأخطاء الشائعة:\n${problem}`;
+  const res = await askAI({
+    prompt, bookId, provider,
+    imageBase64: state.solverImage.base64, mimeType: state.solverImage.mimeType
+  });
+  out.textContent = res.text;
+}
+
+/* ---------- جدول الدراسة والمؤقت ---------- */
+function renderTimer() {
+  const m = String(Math.floor(state.timerSec / 60)).padStart(2, '0');
+  const s = String(state.timerSec % 60).padStart(2, '0');
+  $('timer-display').textContent = `${m}:${s}`;
+}
+
+async function renderTasks() {
+  const tasks = await db.getAll('tasks');
+  $('tasks-list').innerHTML = tasks.length
+    ? tasks.map((t) => `
+      <div class="item-row">
+        <div class="item-top">
+          <label class="inline-row">
+            <input type="checkbox" data-toggle-task="${t.id}" ${t.done ? 'checked' : ''} style="width:auto;" />
+            <strong style="${t.done ? 'text-decoration:line-through;opacity:.6' : ''}">${esc(t.title)}</strong>
+          </label>
+          <button class="btn btn-danger btn-sm" data-del-task="${t.id}">حذف</button>
+        </div>
+        <div class="meta">${esc(t.subject)} | ${esc(t.day)} — ${esc(t.time)}</div>
+      </div>`).join('')
+    : '<div class="meta">لا توجد مهام مجدولة بعد.</div>';
+}
+
+/* ---------- التقدم والدرجات ---------- */
+async function renderProgress() {
+  const scores = await db.getAll('scores');
+  scores.sort((a, b) => a.ts - b.ts);
+  $('scores-list').innerHTML = scores.length
+    ? [...scores].reverse().map((s) => `<div class="item-row"><div class="item-top"><strong>${esc(s.title)}</strong><span class="badge">${s.percent}%</span></div><div class="meta">${esc(s.subject)}</div></div>`).join('')
+    : '<div class="meta">لم تسجل أي درجات اختبارات بعد.</div>';
+
+  const canvas = $('progress-chart');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!scores.length) {
+    ctx.fillStyle = '#888';
+    ctx.font = '16px sans-serif';
+    ctx.fillText('لا توجد درجات لعرض الرسم البياني', 200, 120);
+    return;
+  }
+  const pad = 32;
+  const w = canvas.width - pad * 2;
+  const h = canvas.height - pad * 2;
+  ctx.strokeStyle = '#1d6ef2';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  scores.forEach((s, i) => {
+    const x = pad + (scores.length === 1 ? w / 2 : (i / (scores.length - 1)) * w);
+    const y = pad + h - (s.percent / 100) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  scores.forEach((s, i) => {
+    const x = pad + (scores.length === 1 ? w / 2 : (i / (scores.length - 1)) * w);
+    const y = pad + h - (s.percent / 100) * h;
+    ctx.fillStyle = '#1d6ef2';
+    ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+  });
+}
+
+async function refreshCurrentView(page) {
+  await populateBookSelects();
+  if (page === 'home') await refreshHome();
+  if (page === 'library') await renderLibrary();
+  if (page === 'chat') await renderChatHistory();
+  if (page === 'summary') await renderSummaries();
+  if (page === 'quiz') await renderSavedQuizzes();
+  if (page === 'flashcards') await renderFlashcards();
+  if (page === 'planner') await renderTasks();
+  if (page === 'progress') await renderProgress();
+  if (page === 'settings') {
+    $('set-provider').value = await db.getSetting('defaultProvider', 'gemini');
+    $('set-proxy-url').value = await db.getSetting('proxyUrl', '');
+  }
+}
+
+/* ---------- ربط الأحداث والتشغيل ---------- */
+function readImageFile(file, targetObj, previewEl) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    targetObj.base64 = reader.result;
+    targetObj.mimeType = file.type || 'image/jpeg';
+    previewEl.innerHTML = `<img src="${reader.result}" alt="صورة مرفقة" />`;
+    previewEl.classList.remove('hidden');
+  };
+  reader.readAsDataURL(file);
+}
+
+async function boot() {
+  updateNetworkBadge();
+  window.addEventListener('online', updateNetworkBadge);
+  window.addEventListener('offline', updateNetworkBadge);
+
+  const isDark = await db.getSetting('darkMode', false);
+  await applyTheme(isDark);
+
+  const enterApp = () => {
+    $('screen-splash').classList.add('hidden');
+    $('app-shell').classList.remove('hidden');
+    navigate('home');
+  };
+  $('btn-enter-app').onclick = enterApp;
+  setTimeout(enterApp, 1100);
+
+  $('btn-menu').onclick = () => $('drawer').classList.remove('hidden');
+  $('btn-close-drawer').onclick = () => $('drawer').classList.add('hidden');
+  $('btn-theme-top').onclick = async () => applyTheme(!document.body.classList.contains('dark'));
+
+  document.addEventListener('click', async (e) => {
+    const navBtn = e.target.closest('[data-nav]');
+    if (navBtn) return navigate(navBtn.dataset.nav);
+
+    const openBook = e.target.closest('[data-open-book]');
+    if (openBook) { navigate('reader'); return openBookInReader(openBook.dataset.openBook); }
+
+    const delBook = e.target.closest('[data-del-book]');
+    if (delBook) { await db.deleteBookAndPages(delBook.dataset.delBook); toast('تم حذف الكتاب'); return renderLibrary(); }
+
+    const jump = e.target.closest('[data-jump-page]');
+    if (jump) { state.readerPage = Number(jump.dataset.jumpPage); return renderCurrentReaderPage(); }
+
+    const delSum = e.target.closest('[data-del-sum]');
+    if (delSum) { await db.del('summaries', delSum.dataset.delSum); return renderSummaries(); }
+
+    const saveSum = e.target.closest('[data-save-sum]');
+    if (saveSum) {
+      const id = saveSum.dataset.saveSum;
+      const item = await db.get('summaries', id);
+      item.content = document.querySelector(`[data-edit-sum="${id}"]`).value;
+      await db.put('summaries', item);
+      return toast('تم حفظ التصحيح');
+    }
+
+    const runQ = e.target.closest('[data-run-quiz]');
+    if (runQ) { const q = await db.get('quizzes', runQ.dataset.runQuiz); if (q) startQuiz(q); }
+
+    const delQ = e.target.closest('[data-del-quiz]');
+    if (delQ) { await db.del('quizzes', delQ.dataset.delQuiz); return renderSavedQuizzes(); }
+
+    const rateFc = e.target.closest('[data-rate-fc]');
+    if (rateFc) return rateFlashcard(rateFc.dataset.fcId, Number(rateFc.dataset.rateFc));
+
+    const delTask = e.target.closest('[data-del-task]');
+    if (delTask) { await db.del('tasks', delTask.dataset.delTask); return renderTasks(); }
+  });
+
+  document.addEventListener('change', async (e) => {
+    if (e.target.dataset.toggleTask) {
+      const t = await db.get('tasks', e.target.dataset.toggleTask);
+      if (t) { t.done = e.target.checked; await db.put('tasks', t); renderTasks(); }
+    }
+  });
+
+  $('book-file-input').onchange = (e) => handleBookImport(e.target.files[0]);
+  $('lib-search').oninput = renderLibrary;
+  $('lib-subject-filter').onchange = renderLibrary;
+
+  $('reader-book-select').onchange = (e) => e.target.value && openBookInReader(e.target.value);
+  $('btn-prev-page').onclick = () => { if (state.readerPage > 1) { state.readerPage--; renderCurrentReaderPage(); } };
+  $('btn-next-page').onclick = () => { state.readerPage++; renderCurrentReaderPage(); };
+  $('btn-zoom-in').onclick = () => { state.readerScale = Math.min(2.5, state.readerScale + 0.2); renderCurrentReaderPage(); };
+  $('btn-zoom-out').onclick = () => { state.readerScale = Math.max(0.7, state.readerScale - 0.2); renderCurrentReaderPage(); };
+  $('btn-reader-search').onclick = searchInsideReaderBook;
+  $('btn-ask-page').onclick = () => {
+    $('chat-book-select').value = state.readerBookId || '';
+    $('chat-input').value = `اشرح لي صفحة ${state.readerPage} من هذا الكتاب بشكل مبسط.`;
+    navigate('chat');
+  };
+
+  $('chat-image-input').onchange = (e) => readImageFile(e.target.files[0], state.chatImage, $('chat-image-preview'));
+  $('btn-send-chat').onclick = sendChatMessage;
+  $('btn-clear-chat').onclick = async () => {
+    for (const c of await db.getAll('chats')) await db.del('chats', c.id);
+    renderChatHistory();
+  };
+
+  $('btn-generate-summary').onclick = generateSummary;
+  $('btn-generate-quiz').onclick = generateQuiz;
+
+  $('btn-add-fc').onclick = async () => {
+    const front = $('fc-front').value.trim();
+    const back = $('fc-back').value.trim();
+    if (!front || !back) return toast('اكتب السؤال والإجابة');
+    await db.put('flashcards', { id: `fc_${Date.now()}`, front, back, nextReview: Date.now() });
+    $('fc-front').value = ''; $('fc-back').value = '';
+    toast('تمت إضافة البطاقة'); renderFlashcards();
+  };
+  $('btn-ai-fc').onclick = async () => {
+    const bookId = $('fc-book-select').value;
+    if (!bookId) return toast('اختر كتاباً أولاً');
+    const pages = await db.getBookPages(bookId);
+    if (navigator.onLine && (await db.getSetting('proxyUrl', ''))) {
+      try {
+        const res = await askAI({
+          prompt: `استخرج 5 بطاقات حفظ بصيغة JSON فقط: [{"front":"سؤال","back":"إجابة"}]\nالنص:\n${pages.slice(0, 4).map((p) => p.text).join('\n').slice(0, 5000)}`,
+          bookId, provider: await db.getSetting('defaultProvider', 'gemini')
+        });
+        const arr = parseAIJson(res.text);
+        for (const item of arr) {
+          await db.put('flashcards', { id: `fc_${Date.now()}_${Math.random()}`, front: item.front, back: item.back, nextReview: Date.now() });
+        }
+        toast(`تم توليد ${arr.length} بطاقات`);
+        return renderFlashcards();
+      } catch (err) { toast(err.message); }
+    }
+    toast('توليد البطاقات التلقائي يحتاج اتصالاً بالإنترنت وضبط الخادم الوسيط');
+  };
+
+  $('btn-run-explain').onclick = runExplainOrResearch;
+  $('solver-image-input').onchange = (e) => readImageFile(e.target.files[0], state.solverImage, $('solver-image-preview'));
+  $('btn-solve-problem').onclick = solveProblem;
+
+  $('btn-timer-study').onclick = () => { clearInterval(state.timerInterval); state.timerInterval = null; state.timerSec = 25 * 60; renderTimer(); };
+  $('btn-timer-break').onclick = () => { clearInterval(state.timerInterval); state.timerInterval = null; state.timerSec = 5 * 60; renderTimer(); };
+  $('btn-timer-toggle').onclick = () => {
+    if (state.timerInterval) { clearInterval(state.timerInterval); state.timerInterval = null; return; }
+    state.timerInterval = setInterval(() => {
+      if (state.timerSec > 0) { state.timerSec--; renderTimer(); }
+      else { clearInterval(state.timerInterval); state.timerInterval = null; toast('انتهى وقت الجلسة!'); }
+    }, 1000);
+  };
+
+  $('btn-add-task').onclick = async () => {
+    const title = $('task-title').value.trim();
+    if (!title) return toast('اكتب اسم المهمة');
+    await db.put('tasks', {
+      id: `t_${Date.now()}`, title,
+      subject: $('task-subject').value.trim() || 'عام',
+      day: $('task-day').value, time: $('task-time').value, done: false
+    });
+    $('task-title').value = '';
+    renderTasks();
+  };
+
+  $('btn-save-settings').onclick = async () => {
+    await applyTheme($('set-dark-mode').checked);
+    await db.setSetting('defaultProvider', $('set-provider').value);
+    await db.setSetting('proxyUrl', $('set-proxy-url').value.trim());
+    toast('تم حفظ الإعدادات');
+  };
+
+  $('btn-export-backup').onclick = async () => {
+    const json = await db.exportBackup();
+    const blob = new Blob([json], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `bashar-study-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+  };
+
+  $('import-backup-input').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      await db.importBackup(await file.text());
+      toast('تمت استعادة النسخة الاحتياطية بنجاح');
+      refreshCurrentView(state.currentPage);
+    } catch (err) { toast(err.message); }
+  };
+
+  $('btn-wipe-data').onclick = async () => {
+    if (!confirm('هل أنت متأكد من حذف جميع الكتب والدرجات والمحادثات؟')) return;
+    await db.clearAll();
+    toast('تم حذف جميع البيانات');
+    navigate('home');
+  };
+}
+
+boot();
